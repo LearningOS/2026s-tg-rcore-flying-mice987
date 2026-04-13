@@ -43,6 +43,7 @@ use task::TaskControlBlock;
 use tg_console::log;
 // SBI 调用：set_timer、console_putchar、shutdown 等
 use tg_sbi;
+use tg_syscall::Caller;
 
 // ========== 启动相关 ==========
 
@@ -54,7 +55,7 @@ core::arch::global_asm!(include_str!(env!("APP_ASM")));
 // 最大支持的应用程序数量
 const APP_CAPACITY: usize = 32;
 
-// 定义内核入口点：分配 (APP_CAPACITY + 2) * 8 KiB = 272 KiB 的内核栈
+// 定义内核入口点：分配 (APP_CAPACITY + 2) * 16 KiB = 548 KiB 的内核栈
 // 比第二章更大，因为需要同时容纳多个任务的内核上下文。
 //
 // 这里不再调用 tg_linker::boot0! 宏，避免外部已发布版本与 Rust 2024
@@ -64,7 +65,7 @@ const APP_CAPACITY: usize = 32;
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.entry")]
 unsafe extern "C" fn _start() -> ! {
-    const STACK_SIZE: usize = (APP_CAPACITY + 2) * 8192;
+    const STACK_SIZE: usize = (APP_CAPACITY + 2) * 8192 * 2; // larger stack for syscall trace
     #[unsafe(link_section = ".boot.stack")]
     static mut STACK: [u8; STACK_SIZE] = [0u8; STACK_SIZE];
 
@@ -76,6 +77,8 @@ unsafe extern "C" fn _start() -> ! {
         main = sym rust_main,
     )
 }
+
+static mut TCBS: [TaskControlBlock; APP_CAPACITY] = [TaskControlBlock::ZERO; APP_CAPACITY];
 
 // ========== 内核主函数 ==========
 
@@ -104,15 +107,14 @@ extern "C" fn rust_main() -> ! {
     tg_syscall::init_trace(&SyscallContext);
 
     // 第四步：初始化任务控制块数组，加载所有用户程序
-    let mut tcbs = [TaskControlBlock::ZERO; APP_CAPACITY];
     let mut index_mod = 0;
     for (i, app) in tg_linker::AppMeta::locate().iter().enumerate() {
+        let tcb = unsafe { &mut TCBS[i] };
         let entry = app.as_ptr() as usize;
         log::info!("load app{i} to {entry:#x}");
-        tcbs[i].init(entry);
+        tcb.init(entry);
         index_mod += 1;
     }
-    println!();
 
     // 第五步：开启 S 特权级时钟中断
     // 这是实现抢占式调度的关键：允许时钟中断打断用户程序的执行
@@ -123,7 +125,7 @@ extern "C" fn rust_main() -> ! {
     let mut remain = index_mod; // 剩余未完成的任务数
     let mut i = 0usize; // 当前任务索引
     while remain > 0 {
-        let tcb = &mut tcbs[i];
+        let tcb = unsafe { &mut TCBS[i] };
         if !tcb.finish {
             loop {
                 // 【抢占式调度】设置时钟中断：12500 个时钟周期后触发
@@ -149,7 +151,10 @@ extern "C" fn rust_main() -> ! {
                     // ─── 系统调用：用户程序执行了 ecall 指令 ───
                     Trap::Exception(Exception::UserEnvCall) => {
                         use task::SchedulingEvent as Event;
-                        match tcb.handle_syscall() {
+                        match tcb.handle_syscall(Caller {
+                            entity: i,
+                            flow: 0,
+                        }) {
                             // 普通系统调用（如 write）：处理完成后继续运行当前任务
                             Event::None => continue,
                             // exit 系统调用：任务主动退出
@@ -210,6 +215,8 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
 /// 各依赖库所需接口的具体实现
 mod impls {
+    use crate::{TCBS, task::TaskControlBlock};
+    use tg_console::log::info;
     use tg_syscall::*;
 
     /// 控制台实现：通过 SBI 逐字符输出
@@ -303,15 +310,39 @@ mod impls {
     /// - 查询系统调用计数（trace_request=2）
     impl Trace for SyscallContext {
         #[inline]
-        fn trace(
-            &self,
-            _caller: Caller,
-            _trace_request: usize,
-            _id: usize,
-            _data: usize,
-        ) -> isize {
-            tg_console::log::info!("trace: not implemented");
-            -1
+        fn trace(&self, caller: Caller, trace_request: usize, id: usize, data: usize) -> isize {
+            tg_console::log::info!(
+                "trace: called(caller={}:{},trace_request={trace_request},id={id},data={data})",
+                caller.entity,
+                caller.flow
+            );
+
+            match trace_request {
+                0 => unsafe { *(id as *const u8) as isize },
+                1 => {
+                    unsafe {
+                        *(id as *mut u8) = data as u8;
+                    };
+                    0
+                }
+                2 => {
+                    if id > TaskControlBlock::MAX_SYSCALL_ID_TRACED {
+                        panic!(
+                            "accessing a syscall id not traced!,id={},max={}",
+                            id,
+                            TaskControlBlock::MAX_SYSCALL_ID_TRACED
+                        );
+                    }
+
+                    let tcb = unsafe { &TCBS[caller.entity] };
+                    let count = tcb.syscall_info[id];
+                    // drop(tcb);
+                    info!("id={},count={}", id, count);
+
+                    count as isize
+                }
+                _ => -1, // invalid option
+            }
         }
     }
 }
