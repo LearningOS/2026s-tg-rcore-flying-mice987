@@ -9,6 +9,9 @@
 
 set -e
 
+# This temporarily adds .cargo/bin to PATH
+PATH="$HOME/.cargo/bin:$PATH"
+
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[0;33m'

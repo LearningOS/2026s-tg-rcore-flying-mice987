@@ -374,8 +374,8 @@ fn kernel_space(
 mod impls {
     use crate::{PROCESSES, Sv39, build_flags};
     use alloc::alloc::alloc_zeroed;
-    use core::{alloc::Layout, ptr::NonNull};
-    use tg_console::log;
+    use core::{alloc::Layout, ops::BitOr, ptr::NonNull};
+    use tg_console::log::{self, info, warn};
     use tg_kernel_vm::{
         PageManager,
         page_table::{MmuMeta, PPN, Pte, VAddr, VPN, VmFlags},
@@ -597,7 +597,7 @@ mod impls {
                 1 => unsafe {
                     PROCESSES.get_mut()[caller.entity]
                         .address_space
-                        .translate::<u8>(id.into(), build_flags("U_R_V"))
+                        .translate::<u8>(id.into(), build_flags("U_W_V"))
                         .map_or(-1, |mut ptr| {
                             *ptr.as_mut() = data as u8;
                             0
@@ -631,41 +631,94 @@ mod impls {
             _fd: i32,
             _offset: usize,
         ) -> isize {
-            if addr % (Sv39::PAGE_BITS << 1) != 0 {
+            info!("mmap: addr=0x{:x},len=0x{:x}", addr, len);
+            if addr & ((1 << Sv39::PAGE_BITS) - 1) != 0 {
+                warn!("addr or len not aligned={}", addr);
                 return -1;
             }
             if prot & !0x7 != 0 || prot & 0x7 == 0 {
+                warn!("prot wrong={:b}", prot);
                 return -1;
             }
 
+            let page_cnt = len.div_ceil(1 << Sv39::PAGE_BITS);
             let range = VPN::<Sv39>::new(addr >> Sv39::PAGE_BITS)
-                ..VPN::<Sv39>::new(addr >> Sv39::PAGE_BITS) + len;
+                ..VPN::<Sv39>::new(addr >> Sv39::PAGE_BITS) + page_cnt;
 
             let already_mapped = unsafe {
                 PROCESSES.get_mut()[caller.entity]
                     .address_space
                     .areas
                     .iter()
-                    .find(|iter| iter.contains(&range.start) || iter.contains(&range.end))
+                    .find(|range_exist| {
+                        info!("exist={:?},new={:?}", range_exist, range);
+                        range_exist.contains(&range.start)
+                            || range_exist.contains(&(range.start + (page_cnt - 1)))
+                            || range.contains(&range_exist.start)
+                    })
             };
             match already_mapped {
-                Some(_) => return -1,
+                Some(_) => {
+                    warn!("already mapped addr={}", addr);
+                    return -1;
+                }
                 None => (),
             };
+            let mut flags = VmFlags::<Sv39>::build_from_str("VU");
+            if (prot & (1 << 0)) != 0 {
+                flags = flags.bitor(VmFlags::<Sv39>::build_from_str("R"));
+            }
+            if (prot & (1 << 1)) != 0 {
+                flags = flags.bitor(VmFlags::<Sv39>::build_from_str("W"));
+            }
+            if (prot & (1 << 2)) != 0 {
+                flags = flags.bitor(VmFlags::<Sv39>::build_from_str("X"));
+            }
 
-            
+            info!("map: range={:?}", range);
+            unsafe {
+                PROCESSES.get_mut()[caller.entity]
+                    .address_space
+                    .map(range, &[], 0, flags);
+            }
+            info!("map ok");
+            0
+        }
+
+        fn munmap(&self, caller: Caller, addr: usize, len: usize) -> isize {
+            info!("unmap: addr={:x},len={:x}", addr, len);
+            if addr & ((1 << Sv39::PAGE_BITS) - 1) != 0 {
+                warn!("munmap addr not aligned");
+                return -1;
+            }
+            let page_count = len.div_ceil(1 << Sv39::PAGE_BITS);
+            let start_vpn = VPN::<Sv39>::new(addr >> Sv39::PAGE_BITS);
+
+            let already_mapped = unsafe {
+                PROCESSES.get_mut()[caller.entity]
+                    .address_space
+                    .areas
+                    .iter()
+                    .find(|iter| {
+                        iter.contains(&start_vpn) && iter.contains(&(start_vpn + (page_count - 1)))
+                    })
+            };
+            match already_mapped {
+                Some(_) => (),
+                None => {
+                    warn!("not mapped");
+                    return -1;
+                }
+            };
 
             unsafe {
                 PROCESSES.get_mut()[caller.entity]
-                    .address_space.map(range, &[], 0, VmFlags::build_from_str("URW"));
+                    .address_space
+                    .unmap(start_vpn..start_vpn + page_count);
             }
 
-            -1
-        }
-
-        fn munmap(&self, _caller: Caller, addr: usize, len: usize) -> isize {
-            tg_console::log::info!("munmap: addr = {addr:#x}, len = {len}, not implemented");
-            -1
+            info!("unmap ok");
+            0
         }
     }
 }
