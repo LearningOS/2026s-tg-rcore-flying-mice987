@@ -640,6 +640,9 @@ mod impls {
                 warn!("prot wrong={:b}", prot);
                 return -1;
             }
+            if len == 0 {
+                return 0;
+            }
 
             let page_cnt = len.div_ceil(1 << Sv39::PAGE_BITS);
             let range = VPN::<Sv39>::new(addr >> Sv39::PAGE_BITS)
@@ -657,13 +660,10 @@ mod impls {
                             || range.contains(&range_exist.start)
                     })
             };
-            match already_mapped {
-                Some(_) => {
-                    warn!("already mapped addr={}", addr);
-                    return -1;
-                }
-                None => (),
-            };
+            if already_mapped.is_some() {
+                warn!("already mapped addr={}", addr);
+                return -1;
+            }
             let mut flags = VmFlags::<Sv39>::build_from_str("VU");
             if (prot & (1 << 0)) != 0 {
                 flags = flags.bitor(VmFlags::<Sv39>::build_from_str("R"));
@@ -691,6 +691,9 @@ mod impls {
                 warn!("munmap addr not aligned");
                 return -1;
             }
+            if len == 0 {
+                return 0;
+            }
             let page_count = len.div_ceil(1 << Sv39::PAGE_BITS);
             let start_vpn = VPN::<Sv39>::new(addr >> Sv39::PAGE_BITS);
 
@@ -703,13 +706,10 @@ mod impls {
                         iter.contains(&start_vpn) && iter.contains(&(start_vpn + (page_count - 1)))
                     })
             };
-            match already_mapped {
-                Some(_) => (),
-                None => {
-                    warn!("not mapped");
-                    return -1;
-                }
-            };
+            if already_mapped.is_some() {
+                warn!("not mapped");
+                return -1;
+            }
 
             unsafe {
                 PROCESSES.get_mut()[caller.entity]
