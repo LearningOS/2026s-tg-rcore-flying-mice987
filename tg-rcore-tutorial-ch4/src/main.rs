@@ -50,15 +50,15 @@ use riscv::register::*;
 // 非 RISC-V64 使用占位 Sv39 类型
 #[cfg(not(target_arch = "riscv64"))]
 use stub::Sv39;
-use tg_console::log;
+use tg_console::log::{self, info};
 // 异界传送门：解决跨地址空间上下文切换的核心组件
-use tg_kernel_context::{foreign::MultislotPortal, LocalContext};
+use tg_kernel_context::{LocalContext, foreign::MultislotPortal};
 // RISC-V64 使用真正的 Sv39 类型
 #[cfg(target_arch = "riscv64")]
 use tg_kernel_vm::page_table::Sv39;
 use tg_kernel_vm::{
-    page_table::{MmuMeta, VAddr, VmFlags, VmMeta, PPN, VPN},
     AddressSpace,
+    page_table::{MmuMeta, PPN, VAddr, VPN, VmFlags, VmMeta},
 };
 use tg_sbi;
 use tg_syscall::Caller;
@@ -118,7 +118,7 @@ const MEMORY: usize = 24 << 20;
 // 异界传送门所在虚页：虚拟地址空间的最高页
 // 传送门同时映射到内核和所有用户地址空间的相同虚拟地址，
 // 使得切换 satp（地址空间）后代码仍然可以执行
-const PROTAL_TRANSIT: VPN<Sv39> = VPN::MAX;
+const PROTAL_TRANSIT: VPN<Sv39> = VPN::MAX; // this is trampoline
 
 // ========== 进程列表 ==========
 
@@ -174,7 +174,7 @@ extern "C" fn rust_main() -> ! {
     let portal_ptr = unsafe { alloc(portal_layout) };
     assert!(portal_layout.size() < 1 << Sv39::PAGE_BITS);
     // 第五步：建立内核地址空间（恒等映射 + 传送门映射）
-    let mut ks = kernel_space(layout, MEMORY, portal_ptr as _);
+    let mut kernel_space = kernel_space(layout, MEMORY, portal_ptr as _);
     let portal_idx = PROTAL_TRANSIT.index_in(Sv39::MAX_LEVEL);
     // 第六步：加载用户程序
     // 解析每个 ELF 文件，创建独立地址空间，映射传送门
@@ -184,7 +184,7 @@ extern "C" fn rust_main() -> ! {
         if let Some(process) = Process::new(ElfFile::new(elf).unwrap()) {
             // 将内核传送门页表项共享到用户地址空间
             // 这样传送门在两个地址空间的虚拟地址相同
-            process.address_space.root()[portal_idx] = ks.root()[portal_idx];
+            process.address_space.root()[portal_idx] = kernel_space.root()[portal_idx];
             unsafe { PROCESSES.get_mut().push(process) };
         }
     }
@@ -194,7 +194,7 @@ extern "C" fn rust_main() -> ! {
         unsafe { Layout::from_size_align_unchecked(2 << Sv39::PAGE_BITS, 1 << Sv39::PAGE_BITS) };
     let pages = 2;
     let stack = unsafe { alloc(PAGE) };
-    ks.map_extern(
+    kernel_space.map_extern(
         VPN::new((1 << 26) - pages)..VPN::new(1 << 26),
         PPN::new(stack as usize >> Sv39::PAGE_BITS),
         build_flags("_WRV"),
@@ -232,7 +232,8 @@ extern "C" fn schedule() -> ! {
 
     // 调度循环：持续执行直到所有进程完成
     while !unsafe { PROCESSES.get_mut().is_empty() } {
-        let ctx = unsafe { &mut PROCESSES.get_mut()[0].context };
+        let current_entity: usize = 0; // Note: 这里还没有加入调度, 所有程序顺序执行
+        let ctx = unsafe { &mut PROCESSES.get_mut()[current_entity].context };
         // 通过传送门执行用户进程：
         // 1. 跳转到传送门页面
         // 2. 在传送门内切换 satp 到用户地址空间
@@ -249,11 +250,24 @@ extern "C" fn schedule() -> ! {
                 let ctx = &mut ctx.context;
                 let id: Id = ctx.a(7).into();
                 let args = [ctx.a(0), ctx.a(1), ctx.a(2), ctx.a(3), ctx.a(4), ctx.a(5)];
-                match tg_syscall::handle(Caller { entity: 0, flow: 0 }, id, args) {
+
+                // trace
+                let trace_info =
+                    unsafe { &mut PROCESSES.get_mut()[current_entity].syscall_trace_info };
+                *trace_info.entry(id.0).or_insert(0) += 1;
+
+                match tg_syscall::handle(
+                    Caller {
+                        entity: current_entity,
+                        flow: 0,
+                    },
+                    id,
+                    args,
+                ) {
                     Ret::Done(ret) => match id {
                         // exit：移除进程
                         Id::EXIT => unsafe {
-                            PROCESSES.get_mut().remove(0);
+                            PROCESSES.get_mut().remove(current_entity);
                         },
                         // 其他系统调用：写回返回值，sepc += 4
                         _ => {
@@ -264,7 +278,7 @@ extern "C" fn schedule() -> ! {
                     // 不支持的系统调用：杀死进程
                     Ret::Unsupported(_) => {
                         log::info!("id = {id:?}");
-                        unsafe { PROCESSES.get_mut().remove(0) };
+                        unsafe { PROCESSES.get_mut().remove(current_entity) };
                     }
                 }
             }
@@ -275,10 +289,12 @@ extern "C" fn schedule() -> ! {
                     stval::read(),
                     ctx.context.pc()
                 );
-                unsafe { PROCESSES.get_mut().remove(0) };
+                unsafe { PROCESSES.get_mut().remove(current_entity) };
             }
         }
     }
+
+    info!("Everything is ok, shutdown!");
     // 所有进程执行完毕，关机
     tg_sbi::shutdown(false)
 }
@@ -311,8 +327,8 @@ fn kernel_space(
         log::info!("{region}");
         use tg_linker::KernelRegionTitle::*;
         let flags = match region.title {
-            Text => "X_RV",    // 代码段：可执行、可读
-            Rodata => "__RV",  // 只读数据段：只读
+            Text => "X_RV",        // 代码段：可执行、可读
+            Rodata => "__RV",      // 只读数据段：只读
             Data | Boot => "_WRV", // 数据段/启动段：可读写
         };
         let s = VAddr::<Sv39>::new(region.range.start);
@@ -356,13 +372,13 @@ fn kernel_space(
 /// 与前几章不同，本章的系统调用实现需要进行**地址翻译**：
 /// 用户传入的指针是虚拟地址，内核需要通过页表将其翻译为物理地址才能访问。
 mod impls {
-    use crate::{build_flags, Sv39, PROCESSES};
+    use crate::{PROCESSES, Sv39, build_flags};
     use alloc::alloc::alloc_zeroed;
     use core::{alloc::Layout, ptr::NonNull};
     use tg_console::log;
     use tg_kernel_vm::{
-        page_table::{MmuMeta, Pte, VAddr, VmFlags, PPN, VPN},
         PageManager,
+        page_table::{MmuMeta, PPN, Pte, VAddr, VPN, VmFlags},
     };
     use tg_syscall::*;
 
@@ -562,16 +578,39 @@ mod impls {
     /// - 写入时检查用户地址是否可见且可写
     /// - 使用 translate() 方法进行地址翻译和权限检查
     impl Trace for SyscallContext {
+        /*
+        这个系统调用有三种功能，根据 trace_request 的值不同，执行不同的操作：
+        如果 trace_request 为 0，则 id 应被视作 *const u8 ，表示读取当前任务 id 地址处一个字节的无符号整数值。此时应忽略 data 参数。返回值为 id 地址处的值。
+        如果 trace_request 为 1，则 id 应被视作 *mut u8 ，表示写入 data （作为 u8，即只考虑最低位的一个字节）到该用户程序 id 地址处。返回值应为0。
+        如果 trace_request 为 2，表示查询当前任务调用编号为 id 的系统调用的次数，返回值为这个调用次数。本次调用也计入统计 。
+        否则，忽略其他参数，返回值为 -1。
+                 */
         #[inline]
-        fn trace(
-            &self,
-            _caller: Caller,
-            _trace_request: usize,
-            _id: usize,
-            _data: usize,
-        ) -> isize {
-            tg_console::log::info!("trace: not implemented");
-            -1
+        fn trace(&self, caller: Caller, trace_request: usize, id: usize, data: usize) -> isize {
+            match trace_request {
+                0 => unsafe {
+                    PROCESSES.get_mut()[caller.entity]
+                        .address_space
+                        .translate::<u8>(id.into(), build_flags("U_R_V"))
+                        .map_or(-1, |ptr| (*ptr.as_ref()) as isize)
+                },
+                1 => unsafe {
+                    PROCESSES.get_mut()[caller.entity]
+                        .address_space
+                        .translate::<u8>(id.into(), build_flags("U_R_V"))
+                        .map_or(-1, |mut ptr| {
+                            *ptr.as_mut() = data as u8;
+                            0
+                        })
+                },
+                2 => unsafe {
+                    PROCESSES.get_mut()[caller.entity]
+                        .syscall_trace_info
+                        .get(&id)
+                        .map_or(0, |cnt| *cnt as isize)
+                },
+                _ => -1,
+            }
         }
     }
 
@@ -582,17 +621,45 @@ mod impls {
     impl Memory for SyscallContext {
         fn mmap(
             &self,
-            _caller: Caller,
+            caller: Caller,
             addr: usize,
             len: usize,
             prot: i32,
+
+            // ignored...
             _flags: i32,
             _fd: i32,
             _offset: usize,
         ) -> isize {
-            tg_console::log::info!(
-                "mmap: addr = {addr:#x}, len = {len}, prot = {prot}, not implemented"
-            );
+            if addr % (Sv39::PAGE_BITS << 1) != 0 {
+                return -1;
+            }
+            if prot & !0x7 != 0 || prot & 0x7 == 0 {
+                return -1;
+            }
+
+            let range = VPN::<Sv39>::new(addr >> Sv39::PAGE_BITS)
+                ..VPN::<Sv39>::new(addr >> Sv39::PAGE_BITS) + len;
+
+            let already_mapped = unsafe {
+                PROCESSES.get_mut()[caller.entity]
+                    .address_space
+                    .areas
+                    .iter()
+                    .find(|iter| iter.contains(&range.start) || iter.contains(&range.end))
+            };
+            match already_mapped {
+                Some(_) => return -1,
+                None => (),
+            };
+
+            
+
+            unsafe {
+                PROCESSES.get_mut()[caller.entity]
+                    .address_space.map(range, &[], 0, VmFlags::build_from_str("URW"));
+            }
+
             -1
         }
 
