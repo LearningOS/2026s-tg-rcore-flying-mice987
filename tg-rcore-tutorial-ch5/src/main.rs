@@ -654,7 +654,7 @@ mod impls {
                 .and_then(|elf_start| ElfFile::new(elf_start).ok())
                 .and_then(|elf_file| crate::process::Process::from_elf(elf_file))
                 .map_or(-1, |child_proc| unsafe {
-                    (*processor).add(ProcId::new(), child_proc, current.pid);
+                    (*processor).add(child_proc.pid, child_proc, current.pid);
                     0
                 })
         }
