@@ -23,7 +23,7 @@
 //! - 最后结合 `ch5/src/main.rs` 中对 `PROCESSOR` 的调用观察状态流转。
 
 use crate::process::Process;
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, VecDeque, binary_heap::BinaryHeap};
 use core::cell::UnsafeCell;
 use tg_task_manage::{Manage, PManager, ProcId, Schedule};
 
@@ -32,7 +32,7 @@ use tg_task_manage::{Manage, PManager, ProcId, Schedule};
 /// 封装 `PManager<Process, ProcManager>`，通过 `UnsafeCell` 提供内部可变性。
 /// 在单核环境下是安全的，因为不会出现并发访问。
 pub struct Processor {
-    inner: UnsafeCell<PManager<Process, ProcManager>>,
+    inner: UnsafeCell<PManager<Process, StrideProcManager>>,
 }
 
 unsafe impl Sync for Processor {}
@@ -47,7 +47,7 @@ impl Processor {
 
     /// 获取内部 PManager 的可变引用
     #[inline]
-    pub fn get_mut(&self) -> &mut PManager<Process, ProcManager> {
+    pub fn get_mut(&self) -> &mut PManager<Process, StrideProcManager> {
         unsafe { &mut (*self.inner.get()) }
     }
 }
@@ -71,6 +71,7 @@ pub struct ProcManager {
 
 impl ProcManager {
     /// 创建新的进程管理器
+    #[allow(unused)]
     pub fn new() -> Self {
         Self {
             tasks: BTreeMap::new(),
@@ -110,5 +111,94 @@ impl Schedule<ProcId> for ProcManager {
     /// 从就绪队列头部取出下一个要执行的进程
     fn fetch(&mut self) -> Option<ProcId> {
         self.ready_queue.pop_front()
+    }
+}
+
+#[derive(Debug)]
+struct ScheduleInfo {
+    pid: ProcId,
+    /// 调度, stride为当前进程, 调度时选择最小的
+    stride: usize,
+}
+
+impl PartialOrd for ScheduleInfo {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(match self.stride.cmp(&other.stride) {
+            // lower stride has higher priority
+            core::cmp::Ordering::Less => core::cmp::Ordering::Greater,
+            core::cmp::Ordering::Equal => core::cmp::Ordering::Equal,
+            core::cmp::Ordering::Greater => core::cmp::Ordering::Less,
+        })
+    }
+}
+impl Ord for ScheduleInfo {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        match self.stride.cmp(&other.stride) {
+            // lower stride has higher priority
+            core::cmp::Ordering::Less => core::cmp::Ordering::Greater,
+            core::cmp::Ordering::Equal => core::cmp::Ordering::Equal,
+            core::cmp::Ordering::Greater => core::cmp::Ordering::Less,
+        }
+    }
+}
+impl PartialEq for ScheduleInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.stride == other.stride
+    }
+}
+impl Eq for ScheduleInfo {}
+
+pub struct StrideProcManager {
+    tasks: BTreeMap<ProcId, Process>,
+    /// 就绪队列（FIFO 调度）
+    ready_queue: BinaryHeap<ScheduleInfo>,
+}
+
+impl StrideProcManager {
+    pub fn new() -> Self {
+        Self {
+            tasks: BTreeMap::new(),
+            ready_queue: BinaryHeap::new(),
+        }
+    }
+}
+
+impl Manage<Process, ProcId> for StrideProcManager {
+    fn insert(&mut self, id: ProcId, item: Process) {
+        self.tasks.insert(id, item);
+    }
+
+    fn delete(&mut self, id: ProcId) {
+        self.tasks.remove(&id);
+    }
+
+    fn get_mut(&mut self, id: ProcId) -> Option<&mut Process> {
+        self.tasks.get_mut(&id)
+    }
+}
+
+impl Schedule<ProcId> for StrideProcManager {
+    fn add(&mut self, id: ProcId) {
+        assert!(self.tasks.contains_key(&id));
+        // info!("before: {:?}", self.ready_queue.iter().clone());
+        self.ready_queue.push(ScheduleInfo {
+            pid: id,
+            stride: self.tasks.get(&id).unwrap().stride,
+        });
+        // info!("push: {:?}", id);
+        // info!("after: {:?}", self.ready_queue.iter().clone());
+    }
+
+    fn fetch(&mut self) -> Option<ProcId> {
+        // info!("before: {:?}", self.ready_queue.iter().clone());
+        self.ready_queue.pop().map(|schedule_info| {
+            // info!("popped: {:?}", schedule_info);
+            let pid = self.tasks.get_mut(&schedule_info.pid).map(|proc| {
+                proc.stride += proc.pass;
+                proc.pid
+            }).unwrap();
+            assert_eq!(pid,schedule_info.pid);
+            schedule_info.pid
+        })
     }
 }

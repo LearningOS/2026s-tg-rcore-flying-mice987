@@ -52,7 +52,7 @@ extern crate alloc;
 use crate::{
     impls::{Console, Sv39Manager, SyscallContext},
     process::Process,
-    processor::{PROCESSOR, ProcManager},
+    processor::{PROCESSOR, StrideProcManager},
 };
 use alloc::{alloc::alloc, collections::BTreeMap};
 use core::{alloc::Layout, cell::UnsafeCell, ffi::CStr, mem::MaybeUninit};
@@ -231,7 +231,7 @@ extern "C" fn rust_main() -> ! {
     let initproc_data = APPS.get("initproc").unwrap();
     if let Some(process) = Process::from_elf(ElfFile::new(initproc_data).unwrap()) {
         // 初始化进程管理器并添加 initproc
-        PROCESSOR.get_mut().set_manager(ProcManager::new());
+        PROCESSOR.get_mut().set_manager(StrideProcManager::new());
         PROCESSOR
             .get_mut()
             .add(process.pid, process, ProcId::from_usize(usize::MAX));
@@ -240,7 +240,7 @@ extern "C" fn rust_main() -> ! {
     // ─── 主调度循环 ───
     // 不断从进程管理器中取出就绪进程执行，直到所有进程结束
     loop {
-        let processor: *mut PManager<Process, ProcManager> = PROCESSOR.get_mut() as *mut _;
+        let processor: *mut PManager<Process, StrideProcManager> = PROCESSOR.get_mut() as *mut _;
         if let Some(task) = unsafe { (*processor).find_next() } {
             // 通过异界传送门切换到用户地址空间执行用户程序
             unsafe { task.context.execute(portal, ()) };
@@ -365,11 +365,12 @@ fn map_portal(space: &AddressSpace<Sv39, Sv39Manager>) {
 /// 包括 IO、Process、Scheduling、Clock、Memory 等系统调用接口。
 mod impls {
     use crate::{
-        APPS, PROCESSOR, Sv39, build_flags, process::Process as ProcStruct, processor::ProcManager,
+        APPS, PROCESSOR, Sv39, build_flags, process::Process as ProcStruct,
+        processor::StrideProcManager,
     };
     use alloc::alloc::alloc_zeroed;
     use core::{alloc::Layout, ptr::NonNull, str::from_utf8_unchecked};
-    use tg_console::log::{self, warn};
+    use tg_console::log::{self, info, warn};
     use tg_kernel_vm::{
         PageManager,
         page_table::{MmuMeta, PPN, Pte, VAddr, VPN, VmFlags},
@@ -555,6 +556,7 @@ mod impls {
         /// 等待父进程通过 wait 回收。
         #[inline]
         fn exit(&self, _caller: Caller, exit_code: usize) -> isize {
+            info!("exit: {}", exit_code);
             exit_code as isize
         }
 
@@ -563,7 +565,8 @@ mod impls {
         /// 复制父进程的完整地址空间（深拷贝页表和物理页面），
         /// 父进程返回子进程 PID，子进程返回 0。
         fn fork(&self, _caller: Caller) -> isize {
-            let processor: *mut PManager<ProcStruct, ProcManager> = PROCESSOR.get_mut() as *mut _;
+            let processor: *mut PManager<ProcStruct, StrideProcManager> =
+                PROCESSOR.get_mut() as *mut _;
             let current = unsafe { (*processor).current().unwrap() };
             let parent_pid = current.pid; // 保存父进程 PID
             let mut child_proc = current.fork().unwrap();
@@ -611,7 +614,8 @@ mod impls {
         /// - pid > 0：等待指定 PID 的子进程
         /// 返回值：成功返回子进程 PID，无子进程返回 -1
         fn wait(&self, _caller: Caller, pid: isize, exit_code_ptr: usize) -> isize {
-            let processor: *mut PManager<ProcStruct, ProcManager> = PROCESSOR.get_mut() as *mut _;
+            let processor: *mut PManager<ProcStruct, StrideProcManager> =
+                PROCESSOR.get_mut() as *mut _;
             let current = unsafe { (*processor).current().unwrap() };
             const WRITABLE: VmFlags<Sv39> = build_flags("W_V");
             if let Some((dead_pid, exit_code)) =
@@ -643,7 +647,8 @@ mod impls {
         /// 无需复制父进程地址空间。
         fn spawn(&self, _caller: Caller, path: usize, count: usize) -> isize {
             let current = PROCESSOR.get_mut().current().unwrap();
-            let processor: *mut PManager<ProcStruct, ProcManager> = PROCESSOR.get_mut() as *mut _;
+            let processor: *mut PManager<ProcStruct, StrideProcManager> =
+                PROCESSOR.get_mut() as *mut _;
             current
                 .address_space
                 .translate(VAddr::new(path), build_flags("RV"))
@@ -654,8 +659,9 @@ mod impls {
                 .and_then(|elf_start| ElfFile::new(elf_start).ok())
                 .and_then(|elf_file| crate::process::Process::from_elf(elf_file))
                 .map_or(-1, |child_proc| unsafe {
+                    let res = child_proc.pid.get_usize() as isize;
                     (*processor).add(child_proc.pid, child_proc, current.pid);
-                    0
+                    res
                 })
         }
 
@@ -683,16 +689,17 @@ mod impls {
         }
 
         /// set_priority 系统调用：设置当前进程优先级
-        ///
-        /// TODO: 实现 set_priority 系统调用（练习题：stride 调度算法）
         fn set_priority(&self, _caller: Caller, prio: isize) -> isize {
             let current = PROCESSOR.get_mut().current().unwrap();
-            tg_console::log::info!(
-                "set_priority: pid = {}, prio = {}, not implemented",
-                current.pid.get_usize(),
-                prio
-            );
-            -1
+
+            if !(prio >= 2) {
+                warn!("set_priority: invalid prio={prio}");
+                return -1;
+            }
+
+            current.set_priority(prio as usize);
+
+            prio as isize
         }
     }
 

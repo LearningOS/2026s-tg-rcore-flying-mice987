@@ -22,7 +22,7 @@
 
 use crate::{Sv39, Sv39Manager, build_flags, map_portal, parse_flags};
 use alloc::alloc::alloc_zeroed;
-use core::alloc::Layout;
+use core::{alloc::Layout, usize};
 use tg_kernel_context::{LocalContext, foreign::ForeignContext};
 use tg_kernel_vm::{
     AddressSpace,
@@ -51,9 +51,19 @@ pub struct Process {
     pub heap_bottom: usize,
     /// 当前程序 break 位置（堆顶），通过 sbrk 调整
     pub program_brk: usize,
+
+    /// 每个时间片stride的增量
+    pub pass: usize,
+    pub stride: usize,
 }
 
 impl Process {
+    ///默认的优先级
+    const DEFAULT_PRIO: usize = 16;
+    /// pass=BIG_STRIDE/priority
+    const BIG_STRIDE: usize = 256;
+    pub const DEFAULT_PASS: usize = Self::BIG_STRIDE / Self::DEFAULT_PRIO;
+
     /// exec 系统调用的核心实现：用新程序替换当前进程
     ///
     /// 替换地址空间和上下文，但保留 PID。
@@ -90,6 +100,8 @@ impl Process {
             address_space,
             heap_bottom: self.heap_bottom,
             program_brk: self.program_brk,
+            pass: Self::DEFAULT_PASS,
+            stride: 0,
         })
     }
 
@@ -193,6 +205,8 @@ impl Process {
             address_space,
             heap_bottom,
             program_brk: heap_bottom,
+            pass: Self::DEFAULT_PASS,
+            stride: 0,
         })
     }
 
@@ -230,5 +244,9 @@ impl Process {
 
         self.program_brk = new_brk;
         Some(old_brk)
+    }
+
+    pub fn set_priority(&mut self, prio: usize) {
+        self.pass = Self::BIG_STRIDE / prio;
     }
 }
