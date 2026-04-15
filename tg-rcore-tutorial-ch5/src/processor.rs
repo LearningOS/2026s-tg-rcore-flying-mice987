@@ -124,14 +124,14 @@ struct ScheduleInfo {
 pub struct StrideProcManager {
     tasks: BTreeMap<ProcId, Process>,
     /// 就绪队列（FIFO 调度）
-    ready_queue: BinaryHeap<Reverse<ScheduleInfo>>,
+    ready_queue: Reverse<BinaryHeap<ScheduleInfo>>,
 }
 
 impl StrideProcManager {
     pub fn new() -> Self {
         Self {
             tasks: BTreeMap::new(),
-            ready_queue: BinaryHeap::new(),
+            ready_queue: Reverse(BinaryHeap::new()),
         }
     }
 }
@@ -152,19 +152,15 @@ impl Manage<Process, ProcId> for StrideProcManager {
 
 impl Schedule<ProcId> for StrideProcManager {
     fn add(&mut self, id: ProcId) {
-        // info!("before: {:?}", self.ready_queue.iter().clone());
-        self.ready_queue.push(Reverse(ScheduleInfo {
+        self.ready_queue.0.push(ScheduleInfo {
             pid: id,
             stride: self.tasks.get(&id).unwrap().stride,
-        }));
-        // info!("push: {:?}", id);
-        // info!("after: {:?}", self.ready_queue.iter().clone());
+        });
     }
 
     fn fetch(&mut self) -> Option<ProcId> {
-        // info!("before: {:?}", self.ready_queue.iter().clone());
-        self.ready_queue.pop().and_then(|schedule_info| {
-            self.tasks.get_mut(&schedule_info.0.pid).map(|proc| {
+        self.ready_queue.0.pop().and_then(|schedule_info| {
+            self.tasks.get_mut(&schedule_info.pid).map(|proc| {
                 proc.stride += proc.pass;
                 proc.pid
             })

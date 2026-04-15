@@ -61,7 +61,7 @@ impl Process {
     ///默认的优先级
     const DEFAULT_PRIO: usize = 16;
     /// pass=BIG_STRIDE/priority
-    const BIG_STRIDE: usize = 256;
+    const BIG_STRIDE: usize = 1 << 20;
     pub const DEFAULT_PASS: usize = Self::BIG_STRIDE / Self::DEFAULT_PRIO;
 
     /// exec 系统调用的核心实现：用新程序替换当前进程
