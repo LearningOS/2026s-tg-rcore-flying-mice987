@@ -706,7 +706,7 @@ mod impls {
                         iter.contains(&start_vpn) && iter.contains(&(start_vpn + (page_count - 1)))
                     })
             };
-            if already_mapped.is_some() {
+            if already_mapped.is_none() {
                 warn!("not mapped");
                 return -1;
             }
