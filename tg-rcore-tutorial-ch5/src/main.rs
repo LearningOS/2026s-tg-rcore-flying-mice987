@@ -643,12 +643,10 @@ mod impls {
         /// 无需复制父进程地址空间。
         fn spawn(&self, _caller: Caller, path: usize, count: usize) -> isize {
             let current = PROCESSOR.get_mut().current().unwrap();
-            const READABLE: VmFlags<Sv39> = build_flags("RV");
-
             let processor: *mut PManager<ProcStruct, ProcManager> = PROCESSOR.get_mut() as *mut _;
             current
                 .address_space
-                .translate(VAddr::new(path), READABLE)
+                .translate(VAddr::new(path), build_flags("RV"))
                 .map(|ptr| unsafe {
                     from_utf8_unchecked(core::slice::from_raw_parts(ptr.as_ptr(), count))
                 })
