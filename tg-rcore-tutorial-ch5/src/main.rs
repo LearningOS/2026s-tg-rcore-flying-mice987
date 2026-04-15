@@ -369,7 +369,7 @@ mod impls {
     };
     use alloc::alloc::alloc_zeroed;
     use core::{alloc::Layout, ptr::NonNull, str::from_utf8_unchecked};
-    use tg_console::log;
+    use tg_console::log::{self, warn};
     use tg_kernel_vm::{
         PageManager,
         page_table::{MmuMeta, PPN, Pte, VAddr, VPN, VmFlags},
@@ -733,30 +733,104 @@ mod impls {
     /// 内存管理系统调用实现
     impl Memory for SyscallContext {
         /// mmap 系统调用：映射匿名内存
-        ///
-        /// TODO: 实现 mmap 系统调用（练习题）
         fn mmap(
             &self,
             _caller: Caller,
             addr: usize,
             len: usize,
             prot: i32,
+
+            // unused
             _flags: i32,
             _fd: i32,
             _offset: usize,
         ) -> isize {
-            tg_console::log::info!(
-                "mmap: addr = {addr:#x}, len = {len}, prot = {prot}, not implemented"
-            );
-            -1
+            // alignment check
+            if addr & ((1 << Sv39::PAGE_BITS) - 1) != 0 {
+                warn!("mmap: addr=0x{:x}, not aligned", addr);
+                return -1;
+            }
+
+            // prot check
+            if (prot & (!((1 << 3) - 1)) != 0) || (prot == 0) {
+                warn!("mmap: prot={}, invalid prot", prot);
+                return -1;
+            }
+
+            // do nothing
+            if len == 0 {
+                return 0;
+            }
+
+            // build map flags
+            let mut map_flags = build_flags("UV");
+            if prot & (1 << 0) != 0 {
+                map_flags |= build_flags("R");
+            }
+            if prot & (1 << 1) != 0 {
+                map_flags |= build_flags("W");
+            }
+            if prot & (1 << 2) != 0 {
+                map_flags |= build_flags("X");
+            }
+
+            let page_cnt = len.div_ceil(1 << Sv39::PAGE_BITS);
+            let vpn_start = VAddr::<Sv39>::new(addr).floor();
+            let vpn_end = vpn_start + (page_cnt - 1);
+
+            let current_proc = PROCESSOR.get_mut().current().unwrap();
+
+            let overlap = current_proc.address_space.areas.iter().find(|area| {
+                area.contains(&vpn_start)
+                    || area.contains(&vpn_end)
+                    || (vpn_start..vpn_end + 1).contains(&area.start)
+            });
+            if overlap.is_some() {
+                warn!(
+                    "map: overlap, addr={addr},len={len},vpn_start={vpn_start:?},vpn_end={vpn_end:?},page_cnt={page_cnt},area={overlap:?}"
+                );
+                return -1;
+            }
+
+            // no overlap, ok to map
+            current_proc
+                .address_space
+                .map(vpn_start..vpn_end + 1, &[], 0, map_flags);
+            0
         }
 
         /// munmap 系统调用：取消内存映射
-        ///
-        /// TODO: 实现 munmap 系统调用（练习题）
         fn munmap(&self, _caller: Caller, addr: usize, len: usize) -> isize {
-            tg_console::log::info!("munmap: addr = {addr:#x}, len = {len}, not implemented");
-            -1
+            // addr alignment check
+            if addr & ((1 << Sv39::PAGE_BITS) - 1) != 0 {
+                warn!("munmap: addr=0x{:x}, not aligned", addr);
+                return -1;
+            }
+
+            // do nothing
+            if len == 0 {
+                return 0;
+            }
+
+            let page_cnt = len.div_ceil(1 << Sv39::PAGE_BITS);
+            let vpn_start = VAddr::<Sv39>::new(addr).floor();
+            let vpn_end = vpn_start + (page_cnt - 1);
+
+            let current_proc = PROCESSOR.get_mut().current().unwrap();
+
+            let found_area = current_proc
+                .address_space
+                .areas
+                .iter()
+                .find(|area| area.contains(&vpn_start) && area.contains(&vpn_end));
+
+            if found_area.is_none() {
+                warn!("munmap: no matched mapping!");
+                return -1;
+            }
+            current_proc.address_space.unmap(vpn_start..vpn_end + 1);
+
+            0
         }
     }
 }
