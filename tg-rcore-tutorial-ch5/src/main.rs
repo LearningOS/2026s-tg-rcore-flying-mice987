@@ -52,7 +52,7 @@ extern crate alloc;
 use crate::{
     impls::{Console, Sv39Manager, SyscallContext},
     process::Process,
-    processor::{ProcManager, PROCESSOR},
+    processor::{PROCESSOR, ProcManager},
 };
 use alloc::{alloc::alloc, collections::BTreeMap};
 use core::{alloc::Layout, cell::UnsafeCell, ffi::CStr, mem::MaybeUninit};
@@ -65,8 +65,8 @@ use tg_kernel_context::foreign::MultislotPortal;
 #[cfg(target_arch = "riscv64")]
 use tg_kernel_vm::page_table::Sv39;
 use tg_kernel_vm::{
-    page_table::{MmuMeta, VAddr, VmFlags, VmMeta, PPN, VPN},
     AddressSpace,
+    page_table::{MmuMeta, PPN, VAddr, VPN, VmFlags, VmMeta},
 };
 use tg_sbi;
 use tg_syscall::Caller;
@@ -315,8 +315,8 @@ fn kernel_space(layout: tg_linker::KernelLayout, memory: usize, portal: usize) {
         log::info!("{region}");
         use tg_linker::KernelRegionTitle::*;
         let flags = match region.title {
-            Text => "X_RV",       // 代码段：可执行、可读
-            Rodata => "__RV",     // 只读数据：可读
+            Text => "X_RV",        // 代码段：可执行、可读
+            Rodata => "__RV",      // 只读数据：可读
             Data | Boot => "_WRV", // 数据段：可写、可读
         };
         let s = VAddr::<Sv39>::new(region.range.start);
@@ -365,14 +365,14 @@ fn map_portal(space: &AddressSpace<Sv39, Sv39Manager>) {
 /// 包括 IO、Process、Scheduling、Clock、Memory 等系统调用接口。
 mod impls {
     use crate::{
-        build_flags, process::Process as ProcStruct, processor::ProcManager, Sv39, APPS, PROCESSOR,
+        APPS, PROCESSOR, Sv39, build_flags, process::Process as ProcStruct, processor::ProcManager,
     };
     use alloc::alloc::alloc_zeroed;
-    use core::{alloc::Layout, ptr::NonNull};
+    use core::{alloc::Layout, ptr::NonNull, str::from_utf8_unchecked};
     use tg_console::log;
     use tg_kernel_vm::{
-        page_table::{MmuMeta, Pte, VAddr, VmFlags, PPN, VPN},
         PageManager,
+        page_table::{MmuMeta, PPN, Pte, VAddr, VPN, VmFlags},
     };
     use tg_syscall::*;
     use tg_task_manage::{PManager, ProcId};
@@ -582,11 +582,10 @@ mod impls {
         /// 根据用户传入的程序名（需地址翻译），查找对应的 ELF 数据，
         /// 替换当前进程的地址空间。
         fn exec(&self, _caller: Caller, path: usize, count: usize) -> isize {
-            const READABLE: VmFlags<Sv39> = build_flags("RV");
             let current = PROCESSOR.get_mut().current().unwrap();
             current
                 .address_space
-                .translate::<u8>(VAddr::new(path), READABLE)
+                .translate::<u8>(VAddr::new(path), build_flags("RV"))
                 .map(|ptr| unsafe {
                     core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr.as_ptr(), count))
                 })
@@ -642,15 +641,24 @@ mod impls {
         ///
         /// 与 fork+exec 不同，spawn 直接从 ELF 创建新进程，
         /// 无需复制父进程地址空间。
-        ///
-        /// TODO: 实现 spawn 系统调用（练习题）
-        fn spawn(&self, _caller: Caller, _path: usize, _count: usize) -> isize {
+        fn spawn(&self, _caller: Caller, path: usize, count: usize) -> isize {
             let current = PROCESSOR.get_mut().current().unwrap();
-            tg_console::log::info!(
-                "spawn: parent pid = {}, not implemented",
-                current.pid.get_usize()
-            );
-            -1
+            const READABLE: VmFlags<Sv39> = build_flags("RV");
+
+            let processor: *mut PManager<ProcStruct, ProcManager> = PROCESSOR.get_mut() as *mut _;
+            current
+                .address_space
+                .translate(VAddr::new(path), READABLE)
+                .map(|ptr| unsafe {
+                    from_utf8_unchecked(core::slice::from_raw_parts(ptr.as_ptr(), count))
+                })
+                .and_then(|name| APPS.get(name))
+                .and_then(|elf_start| ElfFile::new(elf_start).ok())
+                .and_then(|elf_file| crate::process::Process::from_elf(elf_file))
+                .map_or(-1, |child_proc| unsafe {
+                    (*processor).add(ProcId::new(), child_proc, current.pid);
+                    0
+                })
         }
 
         /// sbrk 系统调用：调整进程堆空间大小

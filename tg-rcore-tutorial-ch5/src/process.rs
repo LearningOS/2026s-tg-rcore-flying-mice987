@@ -20,18 +20,19 @@
 //! - 再看 `fork`：重点理解地址空间深拷贝与上下文复制；
 //! - 最后看 `exec`：对比“保留 PID、替换执行映像”的设计含义。
 
-use crate::{build_flags, map_portal, parse_flags, Sv39, Sv39Manager};
+use crate::{Sv39, Sv39Manager, build_flags, map_portal, parse_flags};
 use alloc::alloc::alloc_zeroed;
 use core::alloc::Layout;
-use tg_kernel_context::{foreign::ForeignContext, LocalContext};
+use tg_kernel_context::{LocalContext, foreign::ForeignContext};
 use tg_kernel_vm::{
-    page_table::{MmuMeta, VAddr, PPN, VPN},
     AddressSpace,
+    page_table::{MmuMeta, PPN, VAddr, VPN},
 };
 use tg_task_manage::ProcId;
 use xmas_elf::{
+    ElfFile,
     header::{self, HeaderPt2, Machine},
-    program, ElfFile,
+    program,
 };
 
 /// 进程结构体
@@ -69,7 +70,7 @@ impl Process {
     ///
     /// 深拷贝父进程的地址空间（包括所有映射的物理页面），
     /// 子进程获得独立的 PID 和地址空间，但初始上下文与父进程相同。
-    pub fn fork(&mut self) -> Option<Process> {
+    pub fn fork(&self) -> Option<Process> {
         // 分配新的 PID
         let pid = ProcId::new();
         // 复制父进程的完整地址空间（深拷贝所有页表和物理页面数据）
@@ -77,7 +78,7 @@ impl Process {
         let mut address_space: AddressSpace<Sv39, Sv39Manager> = AddressSpace::new();
         parent_addr_space.cloneself(&mut address_space);
         // 在子进程地址空间中映射异界传送门
-        map_portal(&address_space);
+        map_portal(&address_space); // portal page 不在areas里面, 所以需要重新映射
         // 复制父进程的用户态上下文（通用寄存器状态）
         let context = self.context.context.clone();
         // 构建子进程的 satp 值（Mode=Sv39 | 根页表物理页号）
@@ -125,8 +126,8 @@ impl Process {
                 continue;
             }
 
-            let off_file = program.offset() as usize;     // 段在文件中的偏移
-            let len_file = program.file_size() as usize;  // 文件中的数据长度
+            let off_file = program.offset() as usize; // 段在文件中的偏移
+            let len_file = program.file_size() as usize; // 文件中的数据长度
             let off_mem = program.virtual_addr() as usize; // 虚拟地址起始
             let end_mem = off_mem + program.mem_size() as usize; // 虚拟地址结束
             assert_eq!(off_file & PAGE_MASK, off_mem & PAGE_MASK);
