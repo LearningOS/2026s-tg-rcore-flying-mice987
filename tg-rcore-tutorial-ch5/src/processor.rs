@@ -24,7 +24,7 @@
 
 use crate::process::Process;
 use alloc::collections::{BTreeMap, VecDeque, binary_heap::BinaryHeap};
-use core::cell::UnsafeCell;
+use core::{cell::UnsafeCell, cmp::Reverse};
 use tg_task_manage::{Manage, PManager, ProcId, Schedule};
 
 /// 处理器全局管理器
@@ -114,44 +114,17 @@ impl Schedule<ProcId> for ProcManager {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ScheduleInfo {
     pid: ProcId,
     /// 调度, stride为当前进程, 调度时选择最小的
     stride: usize,
 }
 
-impl PartialOrd for ScheduleInfo {
-    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        Some(match self.stride.cmp(&other.stride) {
-            // lower stride has higher priority
-            core::cmp::Ordering::Less => core::cmp::Ordering::Greater,
-            core::cmp::Ordering::Equal => core::cmp::Ordering::Equal,
-            core::cmp::Ordering::Greater => core::cmp::Ordering::Less,
-        })
-    }
-}
-impl Ord for ScheduleInfo {
-    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        match self.stride.cmp(&other.stride) {
-            // lower stride has higher priority
-            core::cmp::Ordering::Less => core::cmp::Ordering::Greater,
-            core::cmp::Ordering::Equal => core::cmp::Ordering::Equal,
-            core::cmp::Ordering::Greater => core::cmp::Ordering::Less,
-        }
-    }
-}
-impl PartialEq for ScheduleInfo {
-    fn eq(&self, other: &Self) -> bool {
-        self.stride == other.stride
-    }
-}
-impl Eq for ScheduleInfo {}
-
 pub struct StrideProcManager {
     tasks: BTreeMap<ProcId, Process>,
     /// 就绪队列（FIFO 调度）
-    ready_queue: BinaryHeap<ScheduleInfo>,
+    ready_queue: BinaryHeap<Reverse<ScheduleInfo>>,
 }
 
 impl StrideProcManager {
@@ -179,26 +152,22 @@ impl Manage<Process, ProcId> for StrideProcManager {
 
 impl Schedule<ProcId> for StrideProcManager {
     fn add(&mut self, id: ProcId) {
-        assert!(self.tasks.contains_key(&id));
         // info!("before: {:?}", self.ready_queue.iter().clone());
-        self.ready_queue.push(ScheduleInfo {
+        self.ready_queue.push(Reverse(ScheduleInfo {
             pid: id,
             stride: self.tasks.get(&id).unwrap().stride,
-        });
+        }));
         // info!("push: {:?}", id);
         // info!("after: {:?}", self.ready_queue.iter().clone());
     }
 
     fn fetch(&mut self) -> Option<ProcId> {
         // info!("before: {:?}", self.ready_queue.iter().clone());
-        self.ready_queue.pop().map(|schedule_info| {
-            // info!("popped: {:?}", schedule_info);
-            let pid = self.tasks.get_mut(&schedule_info.pid).map(|proc| {
+        self.ready_queue.pop().and_then(|schedule_info| {
+            self.tasks.get_mut(&schedule_info.0.pid).map(|proc| {
                 proc.stride += proc.pass;
                 proc.pid
-            }).unwrap();
-            assert_eq!(pid,schedule_info.pid);
-            schedule_info.pid
+            })
         })
     }
 }
